@@ -1,0 +1,227 @@
+trigger:
+- master
+
+resources:
+  containers:
+    - container: sqlserver
+      image: mcr.microsoft.com/mssql/server:2019-latest
+      networks: 
+      - testes
+      env:
+        SA_PASSWORD: SqlServer2019!
+        ACCEPT_EULA: Y
+        MSSQL_PID: Developer
+      ports:
+        - 1433:1433
+
+variables: 
+
+  solution: '**/*.csproj'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  tag: '$(Build.BuildId)'
+  vmImageName: 'ubuntu-latest'
+
+  dockerRegistryServiceConnection: '42d6ee54-2943-4ff7-b454-9da7c8060549'
+  imageRepository: 'webapi'
+  containerRegistry: 'tideman.azurecr.io'
+  dockerfilePath: '**/Dockerfile'  
+  
+  testsDirectory: './pipeline/Postman'
+  File_Log_Execution_WebApp: 'log-execution.log'
+  Path_Project: './src/ASPNETCore8-PostmanTest-Entity'
+  Dll_Project: 'ASPNETCore8-PostmanTest-Entity.dll'
+  iterations: 1
+  collectionPostmanFile: 'Collection_Entity.postman.json'
+  environmentPostmanFile: 'Environment_Local.postman.json'
+  BaseSuporteConnectionString: 'Server=127.0.0.1,1433;Database=BaseSuporte;User Id=sa;Password=SqlServer2019!;TrustServerCertificate=True;'
+  appsettings_Path: 'src/ASPNETCore8-PostmanTest-Entity/appsettings.json'
+  
+stages:
+- stage: Build
+  displayName: Restore, Build and Test
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: Restore
+      inputs:
+         command: 'restore'
+         projects: $(solution)
+         feedsToUse: 'select'      
+
+    - task: DotNetCoreCLI@2
+      displayName: Build
+      inputs:
+        command: 'build'
+        projects: $(solution)
+        arguments: '--configuration $(BuildConfiguration)'
+
+    - task: DotNetCoreCLI@2
+      displayName: Test
+      inputs:
+        command: 'test'
+        projects: '$(solution)'
+
+- stage: DockerPostman
+  displayName: Create Container, Test and Push Image
+  jobs:
+  - job: Build
+    displayName: Docker & Postman
+    pool:
+      vmImage: $(vmImageName)
+    
+    services:
+      sqlserver: sqlserver
+    steps:
+
+    - script: |
+        docker images
+        docker container ls
+      displayName: List Running Containers
+
+    - script: |
+        cd /opt/mssql-tools/bin/
+        ls
+        sleep 10s
+        sqlcmd -S "127.0.0.1,1433" -U sa -P SqlServer2019! -d master -Q "CREATE DATABASE EfCore"
+        echo 'Database created successfully!'
+      displayName: Create Test Database
+
+    - task: Docker@2
+      inputs:
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        command: 'build'
+      displayName: Docker Image Build
+
+    - task: replacetokens@5
+      inputs:
+        targetFiles: '$(appsettings_Path)'
+        encoding: 'auto'
+        tokenPattern: 'default'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        actionOnNoFiles: 'continue'
+        enableTransforms: false
+        enableRecursion: false
+        useLegacyPattern: false
+        defaultValue: '$(BaseSuporteConnectionString)'
+        enableTelemetry: true
+      displayName: Replace Tokens
+
+    - script: cat $(appsettings_Path)
+      displayName: Display AppSettings Data
+    
+    - script: |
+        echo '*** .NET SDKs installed***'
+        dotnet --list-sdks
+        echo '*** .NET default version ***'
+        dotnet --version
+        echo '*** Installing EF Core Tools ***'
+        dotnet tool install --global dotnet-ef
+        dotnet ef
+      displayName: Install EF Core Tools
+
+    - script: |      
+        cd $(Path_Project)
+        dotnet ef migrations add IntegrationTests
+        dotnet ef database update
+        echo 'Running Entity Framework Core migrations'
+      displayName: Run EF Migration
+
+    - script: |
+        dotnet publish $(Path_Project) -c Release -o app
+        echo 'Publishing API...'
+        cd ./app
+        nohup dotnet $(Dll_Project) > $(File_Log_Execution_WebApp) 2>&1 &
+        echo 'Waiting for API initialization...'
+        sleep 10s
+      displayName: Start API in Background
+
+      env:
+        ASPNETCORE_URLS: 'http://localhost:5000'
+
+    - script: |
+        cd $(testsDirectory)        
+        newman run $(collectionPostmanFile) -n $(iterations)
+      displayName: Run API Tests with Postman
+      condition: always() 
+
+    - script: |
+        cd /opt/mssql-tools/bin/
+        sqlcmd -S "127.0.0.1,1433" -U sa -P SqlServer2019! -d master -Q "USE EfCore; SELECT * FROM dbo.PostmanPipeline;"
+      condition: always() 
+      displayName: Display SQL Data
+
+    - script: |        
+        cd $(testsDirectory)
+        npm install -g newman@5.1.2
+        echo "**** Global Newman Version ****"
+        newman -v
+        echo "**** Local Newman version ****"
+        npx newman -v
+        npm install -g newman-reporter-htmlextra@1.21.0
+        npm install -g newman-reporter-junitfullreport@1.0.4
+      displayName:  Install packages for Newman Reporter
+      condition: always()
+
+    - script: |
+        cd $(testsDirectory)
+        npx newman run $(collectionPostmanFile) -n $(iterations) -r htmlextra,junitfullreport
+        cd ./newman
+        ls
+      displayName: Generate HTML results from REST API tests with Newman
+      condition: always() 
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/newman/*.xml'
+        searchFolder: '$(Build.SourcesDirectory)'
+      displayName: Publish Test Summary
+      condition: always()
+
+    - task: UploadPostmanHtmlReport@1
+      displayName: Publish HTML report with Newman      
+      inputs:
+        cwd: '$(System.DefaultWorkingDirectory)/$(testsDirectory)'
+      condition: always() 
+
+    - script: |
+        cd ./app
+        cat $(File_Log_Execution_WebApp)
+      displayName: Display API Execution Log
+      condition: Always()
+
+    - task: Docker@2
+      displayName: Docker Image Push
+      inputs:      
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: '$(imageRepository)'
+        command: 'push'
+        tags: |
+          $(tag)
+          latest
+
+- stage: Deploy
+  dependsOn: DockerPostman
+  displayName: Deploy on Azure
+  jobs:
+  - job: Build
+    displayName: Web APP Deploy
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+     - task: AzureWebAppContainer@1
+       displayName: WebApp Deploy
+       inputs:
+         azureSubscription: 'Pago - 7431(6aaaf5bf-22a8-4a91-a7bc-3a5365a6c5f9)'
+         appName: 'postmanpipeline'
+         containers: 'tideman.azurecr.io/ASPNETCore8-PostmanTest-Entity:latest'
